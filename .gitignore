@@ -1,0 +1,7 @@
+demo-application/venv/
+.env
+
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/key.json
+terraform/*.tfvars

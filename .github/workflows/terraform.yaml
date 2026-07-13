@@ -1,0 +1,81 @@
+name: Terraform workflow
+# on:
+#   push:
+#     branches:
+#       - main
+on:
+  workflow_dispatch:
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.4
+
+      - name: Create GCP credentials file
+        run: echo '${{ secrets.GCP_SA_KEY }}' > key.json
+
+      - name: Terraform Init
+        run: terraform init
+        env:
+          TF_VAR_project_id: ${{ secrets.PROJECT_ID }}
+          TF_VAR_region: ${{ secrets.REGION }}
+          TF_VAR_zone: ${{ secrets.ZONE }}
+          TF_VAR_vpc_name: ${{ secrets.VPC_NAME }}
+          TF_VAR_subnet_name: ${{ secrets.SUBNET_NAME }}
+          TF_VAR_subnet_cidr: ${{ secrets.SUBNET_CIDR }}
+          TF_VAR_cluster_name: ${{ secrets.CLUSTER_NAME }}
+          TF_VAR_node_pool_name: ${{ secrets.NODE_POOL_NAME }}
+          TF_VAR_node_count: ${{ secrets.NODE_COUNT }}
+          TF_VAR_machine_type: ${{ secrets.MACHINE_TYPE }}
+          TF_VAR_disk_type: ${{ secrets.DISK_TYPE }}
+          TF_VAR_disk_size: ${{ secrets.DISK_SIZE }}
+          TF_VAR_image_type: ${{ secrets.IMAGE_TYPE }}
+
+      - name: Terraform Plan
+        run: terraform plan
+        env:
+          TF_VAR_project_id: ${{ secrets.PROJECT_ID }}
+          TF_VAR_region: ${{ secrets.REGION }}
+          TF_VAR_zone: ${{ secrets.ZONE }}
+          TF_VAR_vpc_name: ${{ secrets.VPC_NAME }}
+          TF_VAR_subnet_name: ${{ secrets.SUBNET_NAME }}
+          TF_VAR_subnet_cidr: ${{ secrets.SUBNET_CIDR }}
+          TF_VAR_cluster_name: ${{ secrets.CLUSTER_NAME }}
+          TF_VAR_node_pool_name: ${{ secrets.NODE_POOL_NAME }}
+          TF_VAR_node_count: ${{ secrets.NODE_COUNT }}
+          TF_VAR_machine_type: ${{ secrets.MACHINE_TYPE }}
+          TF_VAR_disk_type: ${{ secrets.DISK_TYPE }}
+          TF_VAR_disk_size: ${{ secrets.DISK_SIZE }}
+          TF_VAR_image_type: ${{ secrets.IMAGE_TYPE }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+        env:
+          TF_VAR_project_id: ${{ secrets.PROJECT_ID }}
+          TF_VAR_region: ${{ secrets.REGION }}
+          TF_VAR_zone: ${{ secrets.ZONE }}
+          TF_VAR_vpc_name: ${{ secrets.VPC_NAME }}
+          TF_VAR_subnet_name: ${{ secrets.SUBNET_NAME }}
+          TF_VAR_subnet_cidr: ${{ secrets.SUBNET_CIDR }}
+          TF_VAR_cluster_name: ${{ secrets.CLUSTER_NAME }}
+          TF_VAR_node_pool_name: ${{ secrets.NODE_POOL_NAME }}
+          TF_VAR_node_count: ${{ secrets.NODE_COUNT }}
+          TF_VAR_machine_type: ${{ secrets.MACHINE_TYPE }}
+          TF_VAR_disk_type: ${{ secrets.DISK_TYPE }}
+          TF_VAR_disk_size: ${{ secrets.DISK_SIZE }}
+          TF_VAR_image_type: ${{ secrets.IMAGE_TYPE }}
+
+      - name: Remove credentials file
+        if: always()
+        working-directory: ./terraform
+        run: rm -f key.json

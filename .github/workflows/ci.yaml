@@ -1,0 +1,86 @@
+# name: CI - Build and Push Image
+# on:
+#   workflow_run:
+#     workflows: ["Terraform workflow"]
+#     types: [completed]
+
+# permissions:
+#   contents: read
+#   id-token: write
+
+# env:
+#   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+#   GAR_REGION: ${{ secrets.GAR_REGION }}
+#   APP_IMAGE: ${{ secrets.GAR_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.GAR_REPOSITORY }}/canary-app
+#   IMAGE_TAG: ${{ github.run_number }}
+
+# jobs:
+#   build-and-push:
+#     if: ${{ github.event.workflow_run.conclusion == 'success' }}
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: Checkout Repository
+#         uses: actions/checkout@v4
+
+#       - name: Authenticate to Google Cloud (OIDC)
+#         uses: google-github-actions/auth@v2
+#         with:
+#           workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+#           service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+#       - name: Setup Google Cloud SDK
+#         uses: google-github-actions/setup-gcloud@v2
+
+#       - name: Configure Docker Authentication
+#         run: |
+#           gcloud auth configure-docker $GAR_REGION-docker.pkg.dev --quiet
+
+#       - name: Build Docker Image
+#         run: |
+#           docker build -t $APP_IMAGE:$IMAGE_TAG .
+
+#       - name: Push Docker Image
+#         run: |
+#           docker push $APP_IMAGE:$IMAGE_TAG
+
+name: CI - Build and Push Image
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GAR_REGION: ${{ secrets.GAR_REGION }}
+  APP_IMAGE: ${{ secrets.GAR_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.GAR_REPOSITORY }}/canary-app
+  IMAGE_TAG: ${{ github.run_number }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker Authentication
+        run: |
+          gcloud auth configure-docker $GAR_REGION-docker.pkg.dev --quiet
+
+      - name: Build Docker Image
+        run: |
+          docker build -t $APP_IMAGE:$IMAGE_TAG ./demo-application
+
+      - name: Push Docker Image
+        run: |
+          docker push $APP_IMAGE:$IMAGE_TAG

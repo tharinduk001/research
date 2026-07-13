@@ -1,0 +1,131 @@
+name: CD - Canary Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy"
+        required: true
+        type: string
+      namespace:
+        description: "Target namespace"
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - uat
+          - prod
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GKE_CLUSTER: ${{ secrets.GKE_CLUSTER_NAME }}
+  GKE_ZONE: ${{ secrets.GKE_ZONE }}
+  IMAGE: ${{ secrets.GAR_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.GAR_REPO }}/${{ secrets.IMAGE_NAME }}
+  NAMESPACE: ${{ inputs.namespace }}
+  IMAGE_TAG: ${{ inputs.image_tag }}
+
+jobs:
+  canary-rollout:
+    runs-on: ubuntu-latest
+    outputs:
+      old_image: ${{ steps.save-image.outputs.old_image }}
+    steps:
+      - name: Authenticate to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+      - run: gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE --project $PROJECT_ID
+
+      - name: Save current stable image
+        id: save-image
+        run: |
+          OLD_TAG=$(kubectl get deployment django-stable -n $NAMESPACE \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "old_image=$OLD_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Set canary image
+        run: |
+          kubectl set image deployment/django-canary \
+            django-container=$IMAGE:$IMAGE_TAG \
+            -n $NAMESPACE
+
+      - name: Step 1 - v1=4 v2=1 (20%)
+        run: |
+          kubectl scale deployment django-stable --replicas=4 -n $NAMESPACE
+          kubectl scale deployment django-canary --replicas=1 -n $NAMESPACE
+          kubectl rollout status deployment/django-canary -n $NAMESPACE --timeout=300s
+      - run: sleep 60
+
+      - name: Step 2 - v1=3 v2=2 (40%)
+        run: |
+          kubectl scale deployment django-stable --replicas=3 -n $NAMESPACE
+          kubectl scale deployment django-canary --replicas=2 -n $NAMESPACE
+          kubectl rollout status deployment/django-canary -n $NAMESPACE --timeout=300s
+      - run: sleep 60
+
+      - name: Step 3 - v1=2 v2=3 (60%)
+        run: |
+          kubectl scale deployment django-stable --replicas=2 -n $NAMESPACE
+          kubectl scale deployment django-canary --replicas=3 -n $NAMESPACE
+          kubectl rollout status deployment/django-canary -n $NAMESPACE --timeout=300s
+      - run: sleep 60
+
+      - name: Step 4 - v1=1 v2=4 (80%)
+        run: |
+          kubectl scale deployment django-stable --replicas=1 -n $NAMESPACE
+          kubectl scale deployment django-canary --replicas=4 -n $NAMESPACE
+          kubectl rollout status deployment/django-canary -n $NAMESPACE --timeout=300s
+      - run: sleep 60
+
+      - name: Step 5 - v1=0 v2=5 (100%)
+        run: |
+          kubectl scale deployment django-stable --replicas=0 -n $NAMESPACE
+          kubectl scale deployment django-canary --replicas=5 -n $NAMESPACE
+          kubectl rollout status deployment/django-canary -n $NAMESPACE --timeout=300s
+
+      - name: Promote - update stable to new version
+        run: |
+          kubectl set image deployment/django-stable \
+            django-container=$IMAGE:$IMAGE_TAG \
+            -n $NAMESPACE
+          kubectl scale deployment django-stable --replicas=5 -n $NAMESPACE
+          kubectl rollout status deployment/django-stable -n $NAMESPACE --timeout=300s
+          kubectl scale deployment django-canary --replicas=0 -n $NAMESPACE
+
+  rollback:
+    needs: canary-rollout
+    if: failure()
+    runs-on: ubuntu-latest
+    env:
+      OLD_IMAGE: ${{ needs.canary-rollout.outputs.old_image }}
+      NAMESPACE: ${{ inputs.namespace }}
+    steps:
+      - name: Authenticate to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+      - run: gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE --project $PROJECT_ID
+
+      - name: Rollback - reset to stable=5 (old image), canary=0
+        run: |
+          if [ -n "$OLD_IMAGE" ]; then
+            kubectl set image deployment/django-stable \
+              django-container=$OLD_IMAGE \
+              -n $NAMESPACE
+          fi
+          kubectl scale deployment django-stable --replicas=5 -n $NAMESPACE
+          kubectl rollout status deployment/django-stable -n $NAMESPACE --timeout=300s
+          kubectl scale deployment django-canary --replicas=0 -n $NAMESPACE

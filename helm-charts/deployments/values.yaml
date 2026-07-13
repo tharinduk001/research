@@ -1,0 +1,90 @@
+namespace: dev
+
+app:
+  name: django
+  port: 8000
+
+service:
+  name: django-svc
+  port: 8000
+  targetPort: 8000
+
+stable:
+  name: django-stable
+  replicas: 5
+  image:
+    repository: duvindune/repo1
+    tag: v1
+
+canary:
+  name: django-canary
+  replicas: 0
+  image:
+    repository: duvindune/repo1
+    tag: v1
+
+resources:
+  requests:
+    memory: "64Mi"
+    cpu: "125m"
+  limits:
+    memory: "128Mi"
+    cpu: "250m"
+
+startupProbe:
+  path: /start/
+  port: 8000
+  periodSeconds: 5
+  timeoutSeconds: 5
+  failureThreshold: 60
+
+readinessProbe:
+  path: /ready/
+  port: 8000
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 3
+
+livenessProbe:
+  path: /live/
+  port: 8000
+  initialDelaySeconds: 20
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+
+secret:
+  name: postgres-secret
+  POSTGRES_DB: db
+  POSTGRES_USER: appuser
+  POSTGRES_PASSWORD: changeme123
+  SECRET_KEY: "v!kyc=--$*^h67u-^rhau64x(_5=63a0127a!(tt7@^loo3rf+"
+  DB_HOST: postgres-svc
+  DB_PORT: "5432"
+
+postgres:
+  name: postgres
+  image: postgres:16
+  replicas: 1
+  port: 5432
+  serviceName: postgres-svc
+  pgData: /var/lib/postgresql/data/pgdata
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+  storage: 1Gi
+
+ingress:
+  name: django-ingress
+  staticIpName: k8s-test
+  managedCertificate: django-mc
+  host: www.duvindu.org
+
+certificate:
+  name: django-mc
+  domain: www.duvindu.org
