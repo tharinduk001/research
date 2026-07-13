@@ -1,0 +1,54 @@
+# Values for grafana/loki-stack (Loki + Promtail + Grafana)
+# Installed into the "monitoring" namespace via:
+#   helm install loki grafana/loki-stack -n monitoring --create-namespace -f helm-charts/monitoring/loki-stack-values.yaml
+#
+# Phase 1 of observability: logs only (no Prometheus/metrics yet).
+# Ephemeral storage on purpose — no PVC/persistent disk, logs are lost if the
+# Loki pod restarts. Acceptable for now; revisit if long-term retention is needed.
+
+loki:
+  enabled: true
+  isDefault: true
+  persistence:
+    enabled: false
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+promtail:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 150m
+      memory: 128Mi
+
+grafana:
+  enabled: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+  # Auto-provisions Loki as a Grafana datasource — no manual wiring needed.
+  sidecar:
+    datasources:
+      enabled: true
+
+# Not needed for Phase 1
+prometheus:
+  enabled: false
+fluent-bit:
+  enabled: false
+filebeat:
+  enabled: false
+logstash:
+  enabled: false

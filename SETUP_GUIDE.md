@@ -32,6 +32,8 @@ Follow it top to bottom to rebuild the project from scratch without AI assistanc
 | Deployer service account | `gh-actions-deployer@research-502304.iam.gserviceaccount.com` |
 | GitHub repo | `tharinduk001/research` |
 | GKE node default SA | `535060614688-compute@developer.gserviceaccount.com` |
+| Monitoring namespace | `monitoring` |
+| Loki Helm release name | `loki` (chart `grafana/loki-stack`) |
 
 ---
 
@@ -662,3 +664,182 @@ gcloud iam workload-identity-pools delete github-pool --location=global --projec
 | Check deployments | `kubectl get deployments -n dev` |
 | Check ingress/cert | `kubectl get ingress -n dev` / `kubectl get managedcertificate -n dev` |
 | Local test | `docker compose up --build -d` then `curl localhost:8000/health/` |
+| Open Grafana (logs) | `kubectl port-forward svc/loki-grafana -n monitoring 3000:80` then browse `localhost:3000` |
+| Get Grafana admin password | `kubectl get secret loki-grafana -n monitoring -o jsonpath='{.data.admin-password}' \| base64 -d` |
+
+---
+
+## 19. Observability — logs via Loki + Promtail + Grafana
+
+Added after the pipeline was already fully working, as **Phase 1** of observability
+(logs first; metrics/Prometheus deliberately deferred — see §19.7). This is a pure
+workload addition: it does **not** touch Terraform, GKE cluster sizing, or the app's
+CI/CD — it's just a new Helm release running alongside the app.
+
+### 19.1 Why this approach
+
+- **Helm**, not raw manifests or Terraform, because a Helm chart already exists in this
+  repo (`helm-charts/deployments/`) establishing Helm as an already-used tool, and
+  Grafana Labs ships an official chart that bundles everything needed (Loki + Promtail
+  + Grafana) in one release.
+- **Promtail** (not Filebeat/Fluent Bit/Logstash) as the log-shipping agent, because the
+  chosen chart wires it up by default with zero extra config — it runs as a DaemonSet,
+  one pod per node, and tails every container's stdout/stderr directly off the node
+  filesystem. No code or app changes needed to get logs flowing.
+- **Ephemeral storage** (no PersistentVolumeClaim) for Loki, deliberately — this is a
+  first pass at "can we view app logs," not a long-term retention system. Logs are
+  lost if the `loki-0` pod restarts. Revisit with `loki.persistence.enabled: true` if
+  retention starts to matter.
+- **`kubectl port-forward`** (not a public Ingress) to reach Grafana — avoids
+  provisioning a new DNS record/ManagedCertificate for a UI that's only needed
+  on-demand while investigating something.
+
+### 19.2 Capacity check before installing anything
+
+Before adding any new workload, the existing 2-node cluster's headroom was checked —
+important because this project already hit a CPU-starvation issue once (§9.3), so
+resource requests were sized conservatively rather than left at chart defaults:
+
+```bash
+kubectl describe nodes | grep -A5 "Allocatable:"
+kubectl describe nodes | grep -B2 -A15 "Allocated resources:"
+kubectl top nodes
+```
+
+At the time of installing this stack, both `e2-standard-4` nodes had **~2.7-2.9 CPU
+cores and ~12Gi memory free** each (only ~25-30% of CPU requested by the existing app
++ GKE system pods) — comfortably enough for Loki/Promtail/Grafana without any node
+resize.
+
+### 19.3 Add the Helm repo
+
+```bash
+helm repo add grafana https://grafana.github.io/helm-charts
+helm repo update grafana
+```
+
+### 19.4 Values file (checked into the repo)
+
+Created `helm-charts/monitoring/loki-stack-values.yaml` — sets explicit conservative
+resource requests/limits (so this new stack has a known, bounded footprint on the
+2-node cluster), enables Grafana with the Loki datasource auto-provisioned via the
+chart's sidecar, and explicitly disables the parts of this multi-tool chart that
+aren't needed for Phase 1 (`prometheus`, `fluent-bit`, `filebeat`, `logstash`):
+
+```yaml
+# helm-charts/monitoring/loki-stack-values.yaml
+
+loki:
+  enabled: true
+  isDefault: true
+  persistence:
+    enabled: false
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+promtail:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 150m
+      memory: 128Mi
+
+grafana:
+  enabled: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+  sidecar:
+    datasources:
+      enabled: true
+
+prometheus:
+  enabled: false
+fluent-bit:
+  enabled: false
+filebeat:
+  enabled: false
+logstash:
+  enabled: false
+```
+
+### 19.5 Install
+
+```bash
+helm install loki grafana/loki-stack -n monitoring --create-namespace \
+  -f helm-charts/monitoring/loki-stack-values.yaml
+```
+
+> **Note:** Helm prints `WARNING: This chart is deprecated` on install. It still works
+> fully — Grafana Labs' long-term recommendation is the separate `loki` + `grafana`
+> charts with an agent like Alloy instead of this all-in-one chart, but for a
+> logs-only Phase 1 this deprecated umbrella chart is the fastest correct path. Worth
+> migrating off if this project's observability needs grow significantly.
+
+Wait for everything to come up:
+```bash
+kubectl wait --for=condition=Ready pod -l app=loki -n monitoring --timeout=90s
+kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=grafana -n monitoring --timeout=90s
+kubectl get pods -n monitoring
+```
+Expected result: `loki-0` (1/1), `loki-grafana-<hash>` (2/2), and one `loki-promtail-<hash>`
+pod per node (2/2 total on a 2-node cluster), all `Running`.
+
+Confirms no PVC was created (ephemeral storage, as intended):
+```bash
+kubectl get pvc -n monitoring   # -> "No resources found in monitoring namespace."
+```
+
+### 19.6 Access Grafana and view logs
+
+Get the auto-generated admin password (username is always `admin`):
+```bash
+kubectl get secret loki-grafana -n monitoring -o jsonpath='{.data.admin-password}' | base64 -d
+```
+
+Port-forward Grafana to your machine:
+```bash
+kubectl port-forward svc/loki-grafana -n monitoring 3000:80
+```
+
+Open `http://localhost:3000`, log in with `admin` / `<password from above>` (change it
+under user settings). Go to **Explore** → select the **Loki** datasource (already
+pre-wired by the chart's sidecar, no manual setup) → run a LogQL query:
+
+```logql
+{namespace="dev"}                                # every pod in the dev namespace
+{namespace="dev", pod=~"django-canary.*"}        # canary pods only (useful mid-rollout)
+{namespace="dev", pod=~"django-stable.*"}        # stable pods only
+```
+
+### 19.7 What was deliberately deferred
+
+- **Prometheus / metrics** — not installed yet. GKE already runs Google's Managed
+  Service for Prometheus by default (`gmp-system` namespace: `gmp-operator` +
+  `collector` pods, near-zero footprint), which may cover metrics needs without
+  self-hosting `kube-prometheus-stack` at all. Decision deferred until metrics are
+  actually needed.
+- **Persistent log storage** — see §19.1; revisit if log history needs to survive
+  pod restarts.
+- **Public Grafana URL** — port-forward only for now; would need a new DNS record +
+  `ManagedCertificate` (same pattern as §3/§9's app Ingress) if a permanent URL
+  becomes worth the setup time.
+
+### 19.8 Teardown (if needed)
+
+```bash
+helm uninstall loki -n monitoring
+kubectl delete namespace monitoring
+```
