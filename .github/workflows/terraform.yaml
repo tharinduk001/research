@@ -6,6 +6,10 @@ name: Terraform workflow
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   terraform:
     runs-on: ubuntu-latest
@@ -16,13 +20,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Authenticate to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.11.4
-
-      - name: Create GCP credentials file
-        run: echo '${{ secrets.GCP_SA_KEY }}' > key.json
 
       - name: Terraform Init
         run: terraform init
@@ -74,8 +82,3 @@ jobs:
           TF_VAR_disk_type: ${{ secrets.DISK_TYPE }}
           TF_VAR_disk_size: ${{ secrets.DISK_SIZE }}
           TF_VAR_image_type: ${{ secrets.IMAGE_TYPE }}
-
-      - name: Remove credentials file
-        if: always()
-        working-directory: ./terraform
-        run: rm -f key.json

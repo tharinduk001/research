@@ -9,7 +9,7 @@ metadata:
     networking.gke.io/managed-certificates: django-mc
 spec:
   rules:
-    - host: www.duvindu.org
+    - host: research.tharinduk001.com
       http:
         paths:
           - path: /*

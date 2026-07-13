@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: django-container
-          image: duvindune/repo1:v1
+          image: us-central1-docker.pkg.dev/research-502304/canary-repo/canary-app:1
           ports:
             - containerPort: 8000
           resources:
