@@ -32,6 +32,9 @@ Follow it top to bottom to rebuild the project from scratch without AI assistanc
 | Deployer service account | `gh-actions-deployer@research-502304.iam.gserviceaccount.com` |
 | GitHub repo | `tharinduk001/research` |
 | GKE node default SA | `535060614688-compute@developer.gserviceaccount.com` |
+| Monitoring namespace | `default` (Prometheus/Grafana/Alertmanager/Loki/Promtail) |
+| Monitoring Helm releases | `prometheus` (kube-prometheus-stack), `loki`, `promtail` |
+| Monitoring source repo | `github.com/tharinduk001/Monitoring-Stack-Workflow` (workflow file adapted into this repo) |
 
 ---
 
@@ -662,3 +665,265 @@ gcloud iam workload-identity-pools delete github-pool --location=global --projec
 | Check deployments | `kubectl get deployments -n dev` |
 | Check ingress/cert | `kubectl get ingress -n dev` / `kubectl get managedcertificate -n dev` |
 | Local test | `docker compose up --build -d` then `curl localhost:8000/health/` |
+| Trigger monitoring stack deploy | `gh workflow run automate.yaml --repo tharinduk001/research -f namespace=default -f install_prometheus_grafana=true -f install_loki=true -f install_promtail=true` |
+| Open Grafana | `kubectl port-forward svc/prometheus-grafana -n default 8081:80` then browse `localhost:8081` |
+| Get Grafana admin password | `kubectl get secret prometheus-grafana -n default -o jsonpath='{.data.admin-password}' \| base64 -d` |
+| Open Prometheus | `kubectl port-forward svc/prometheus-kube-prometheus-prometheus -n default 9090:9090` then browse `localhost:9090` |
+| Open Alertmanager | `kubectl port-forward svc/prometheus-kube-prometheus-alertmanager -n default 9093:9093` then browse `localhost:9093` |
+
+---
+
+## 19. Observability — Prometheus + Grafana + Alertmanager + Loki + Promtail
+
+Full monitoring stack, adapted from a separate reference repo the team lead shared:
+`github.com/tharinduk001/Monitoring-Stack-Workflow`. Unlike an earlier logs-only
+attempt (Loki+Grafana via the deprecated `loki-stack` chart, since fully removed),
+this uses the correct current charts and also wires up **application-level metrics**
+(not just cluster/node metrics) via a custom Prometheus `ServiceMonitor`.
+
+### 19.1 What actually gets installed
+
+A single GitHub Actions workflow (`workflow_dispatch`) installs three separate Helm
+releases into one namespace:
+- **`prometheus-community/kube-prometheus-stack`** — an umbrella chart bundling the
+  Prometheus Operator, Prometheus itself, Alertmanager, Grafana, kube-state-metrics,
+  and node-exporter. Installing it also registers new Kubernetes CRDs (`Prometheus`,
+  `ServiceMonitor`, `Alertmanager`, `PrometheusRule`) and ships a large bundle of
+  pre-built dashboards (from the `kubernetes-mixin` project) as labeled ConfigMaps
+  that a sidecar container in the Grafana pod auto-imports on startup — this is why
+  working dashboards and a pre-wired Prometheus datasource appear with **zero**
+  custom Grafana configuration.
+- **`grafana/loki`** — modern standalone Loki chart (SingleBinary mode, filesystem
+  storage, no persistence). Ships with no dashboards and does not auto-register
+  itself as a Grafana datasource — that has to be done manually (§19.7).
+- **`grafana/promtail`** — DaemonSet, one pod per node, tails container logs and
+  pushes them to Loki. Stateless, no UI of its own.
+
+### 19.2 Why WIF didn't need any changes
+
+The workflow authenticates via the same Workload Identity Federation setup as every
+other workflow in this repo (§4) — because it runs *inside* `tharinduk001/research`,
+it automatically satisfies the existing `attribute-condition` (which trusts exactly
+this repo), so no new WIF pool/provider/IAM binding was needed. (A Service Account
+key was considered and explicitly rejected — see project decision log.)
+
+### 19.3 Files brought in from the reference repo
+
+Only 2 files were actually needed — everything else in that repo (a whole separate
+demo Django app, manual notes duplicating the workflow's own Helm commands, WIF setup
+notes for a different GCP project) was not applicable here:
+
+**`.github/workflows/automate.yaml`** — copied in unmodified. `workflow_dispatch`
+inputs: `namespace` (choice: prod/staging/dev/qa/default), and 3 booleans to
+independently toggle installing Prometheus+Grafana / Loki / Promtail.
+
+**`k8s-manifests/svc-monitor.yaml`** — copied in and used as-is (already matched our
+app):
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: django-servicemonitor
+  labels:
+    release: prometheus     # must match the Prometheus Helm release name
+spec:
+  jobLabel: job
+  selector:
+    matchLabels:
+      app: django            # matches django-svc's labels
+  endpoints:
+    - port: web              # matches the named port on django-svc
+      path: /metrics
+      interval: 15s
+```
+
+### 19.4 Fix required: `django-svc` had no labels or named port
+
+The `ServiceMonitor` above selects Services by **their own `metadata.labels`** (not
+their pod-selector) and references the scrape port **by name**, not number. Our
+existing `k8s-manifests/app-svc.yaml` had neither — it would have matched zero
+targets. Fixed:
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: django-svc
+  namespace: dev
+  labels:
+    app: django              # added — required for ServiceMonitor's selector to match
+spec:
+  type: ClusterIP
+  selector:
+    app: django
+  ports:
+    - name: web               # added — required for ServiceMonitor's `port: web` to resolve
+      port: 8000
+      targetPort: 8000
+```
+Applied directly (safe, no downtime — Service selector/spec unchanged, only labels
+and a port name added):
+```bash
+kubectl apply -f k8s-manifests/app-svc.yaml
+```
+
+### 19.5 GitHub secrets
+
+The workflow expects different secret **names** than our existing ones for the same
+values (naming-convention mismatch, same pattern as the `terraform.yaml` vs
+`ci.yaml`/`cd.yaml` quirk in §7) — `GCP_PROJECT_ID` and `GKE_CLUSTER_NAME` already
+existed and needed no change; 2 new ones were required:
+```bash
+REPO="tharinduk001/research"
+gh secret set GCP_REGION --repo "$REPO" --body "us-central1"
+gh secret set GKE_CLUSTER_LOCATION --repo "$REPO" --body "us-central1-a"
+```
+
+### 19.6 Instrument the Django app for `/metrics`
+
+Without this, Prometheus has a target to scrape but nothing to scrape *from* — the
+app itself must expose metrics.
+
+```bash
+pip install django-prometheus   # added to demo-application/requirements.txt
+```
+
+**`demo-application/simply/settings.py`**:
+```python
+INSTALLED_APPS = [
+    ...
+    'home.apps.HomeConfig',
+    'django_prometheus',
+]
+
+MIDDLEWARE = [
+    'django_prometheus.middleware.PrometheusBeforeMiddleware',   # must be first
+    'django.middleware.security.SecurityMiddleware',
+    ...
+    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'django_prometheus.middleware.PrometheusAfterMiddleware',    # must be last
+]
+```
+
+**`demo-application/simply/urls.py`**:
+```python
+urlpatterns = [
+    path('admin/', admin.site.urls),
+    path('', include('home.urls')),
+    path('', include('django_prometheus.urls')),   # exposes /metrics
+]
+```
+
+> **Encoding gotcha hit during this step:** `demo-application/requirements.txt` was
+> already UTF-16 encoded (a pre-existing quirk, §16). Rewriting it while adding the
+> new dependency produced UTF-16 **without a byte-order mark**, which broke `pip`
+> entirely (`ERROR: Invalid requirement: 'a\x00s\x00g\x00i\x00r\x00e\x00f\x00...'`) —
+> the original file's BOM was apparently what let earlier builds succeed; without one,
+> pip reads raw null-interleaved bytes. Fixed by recreating the file as plain
+> ASCII/UTF-8 (`file requirements.txt` should report `ASCII text`, not `data`). If
+> editing this file again, verify its encoding before pushing:
+> ```bash
+> file demo-application/requirements.txt   # must say "ASCII text", not "data"
+> ```
+
+### 19.7 Commit, push, deploy the monitoring stack
+
+```bash
+git add .github/workflows/automate.yaml k8s-manifests/svc-monitor.yaml k8s-manifests/app-svc.yaml
+git commit -m "Add Prometheus+Grafana+Loki+Promtail monitoring pipeline"
+git push origin main
+
+gh workflow run automate.yaml --repo tharinduk001/research \
+  -f namespace=default \
+  -f install_prometheus_grafana=true \
+  -f install_loki=true \
+  -f install_promtail=true
+gh run list --repo tharinduk001/research --workflow=automate.yaml --limit 1   # get run id
+gh run watch <run-id> --repo tharinduk001/research --exit-status
+```
+Takes ~4 minutes. Installs into the `default` namespace: Prometheus, Grafana,
+Alertmanager, kube-state-metrics, 2× node-exporter (one per node), Loki, 2× Promtail
+(one per node).
+
+### 19.8 Deploy the instrumented app itself
+
+The `ServiceMonitor`/Service fixes only matter once the *running* app pods actually
+have `django-prometheus` in them — that requires a normal release cycle (§14):
+```bash
+git add demo-application/requirements.txt demo-application/simply/settings.py demo-application/simply/urls.py
+git commit -m "Instrument Django app with django-prometheus for /metrics endpoint"
+git push origin main
+
+gh workflow run ci.yaml --repo tharinduk001/research
+gh run list --repo tharinduk001/research --workflow=ci.yaml --limit 1   # note run number = new image tag
+gh run watch <run-id> --repo tharinduk001/research --exit-status
+
+gh workflow run cd.yaml --repo tharinduk001/research -f image_tag=<N> -f namespace=dev
+gh run list --repo tharinduk001/research --workflow=cd.yaml --limit 1
+gh run watch <run-id> --repo tharinduk001/research --exit-status
+```
+
+Then apply the `ServiceMonitor` (only possible after §19.7 has run — its CRD doesn't
+exist until Prometheus Operator installs it):
+```bash
+kubectl apply -f k8s-manifests/svc-monitor.yaml -n dev
+```
+
+### 19.9 Verify metrics are actually flowing
+
+```bash
+# App exposes /metrics directly
+kubectl port-forward svc/django-svc -n dev 8000:8000
+curl -s http://localhost:8000/metrics | head -20
+
+# Prometheus is scraping it (look for "health":"up" under serviceMonitor/dev/django-servicemonitor)
+kubectl port-forward svc/prometheus-kube-prometheus-prometheus -n default 9090:9090
+curl -s "http://localhost:9090/api/v1/targets" | grep -A1 "django-servicemonitor"
+```
+
+### 19.10 Access the dashboards
+
+```bash
+# Grafana
+kubectl port-forward svc/prometheus-grafana -n default 8081:80
+kubectl get secret prometheus-grafana -n default -o jsonpath='{.data.admin-password}' | base64 -d
+# -> browse http://localhost:8081, login admin / <password above>
+
+# Prometheus (no login)
+kubectl port-forward svc/prometheus-kube-prometheus-prometheus -n default 9090:9090
+# -> http://localhost:9090 — Status > Targets to check scrape health, Graph for PromQL
+
+# Alertmanager (no login)
+kubectl port-forward svc/prometheus-kube-prometheus-alertmanager -n default 9093:9093
+# -> http://localhost:9093
+```
+
+> **Windows port gotcha:** ports `3000`/`3001` failed to bind locally
+> (`bind: An attempt was made to access a socket in a way forbidden by its access
+> permissions`) — a Windows-reserved/excluded port range (common with Docker
+> Desktop/WSL/Hyper-V), not a real conflict. Used `8081` instead. If a local
+> port-forward fails the same way, just pick a different local port — the remote
+> side (`:80`, `:9090`, etc.) stays the same.
+
+Grafana here comes with Prometheus **pre-wired as a datasource** and a set of
+pre-built dashboards already imported (Kubernetes cluster overview, node metrics,
+pod resources) — see §19.1 for why. Loki is **not** auto-wired by this chart and had
+to be added manually:
+```bash
+curl -s -X POST http://admin:<grafana-password>@localhost:8081/api/datasources \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Loki","type":"loki","url":"http://loki.default.svc.cluster.local:3100","access":"proxy","isDefault":false}'
+```
+
+### 19.11 Example queries once flowing
+
+PromQL (Prometheus Graph tab or Grafana Explore → Prometheus datasource):
+```promql
+up{job=~".*django.*"}
+django_http_requests_total_by_view_transport_method_total
+django_http_requests_latency_seconds_by_view_method_bucket
+```
+
+LogQL (Grafana Explore → Loki datasource):
+```logql
+{namespace="dev", pod=~"django-stable.*"}
+```
