@@ -670,6 +670,8 @@ gcloud iam workload-identity-pools delete github-pool --location=global --projec
 | Get Grafana admin password | `kubectl get secret prometheus-grafana -n default -o jsonpath='{.data.admin-password}' \| base64 -d` |
 | Open Prometheus | `kubectl port-forward svc/prometheus-kube-prometheus-prometheus -n default 9090:9090` then browse `localhost:9090` |
 | Open Alertmanager | `kubectl port-forward svc/prometheus-kube-prometheus-alertmanager -n default 9093:9093` then browse `localhost:9093` |
+| Check track split is working | `curl -s 'http://localhost:9090/api/v1/query' --data-urlencode 'query=count by (track) (up{job=~"django.*"})'` |
+| Check DB exporter connected | `curl -s 'http://localhost:9090/api/v1/query' --data-urlencode 'query=pg_up'` (1 = connected) |
 
 ---
 
@@ -857,6 +859,16 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'django_prometheus.middleware.PrometheusAfterMiddleware',    # must be last
 ]
+
+# Instruments queries from the Django app's side. Drop-in replacement for
+# 'django.db.backends.postgresql' — same behaviour, plus metrics. Without this
+# the django_db_* metrics do not exist at all.
+DATABASES = {
+    'default': {
+        'ENGINE': 'django_prometheus.db.backends.postgresql',
+        ...
+    }
+}
 ```
 
 **`demo-application/simply/urls.py`**:
@@ -993,4 +1005,77 @@ histogram_quantile(0.95,
 LogQL (Grafana Explore → Loki datasource):
 ```logql
 {namespace="dev", pod=~"django-stable.*"}
+```
+
+> **Note:** Promtail does **not** attach a `track` label to logs (it tags `app`,
+> `pod`, `namespace`, `node_name`, `container`, `detected_level`). Until that is
+> configured, separate tracks in logs by pod name: `pod=~"django-canary.*"`.
+
+---
+
+## 20. Database metrics (two independent sources)
+
+Two complementary views, both needed — they fail differently and catch different
+problems:
+
+| Source | Vantage point | Catches |
+|---|---|---|
+| `django_prometheus` DB backend | what the **app** experiences | query errors, bad migrations, app-side latency |
+| `postgres_exporter` | what the **server** is doing | connection exhaustion, locks, DB size growth |
+
+### 20.1 App-side (django_prometheus)
+
+Already covered in §19.6 — the `ENGINE` line. Once deployed it provides:
+`django_db_execute_total`, `django_db_query_duration_seconds_*`,
+`django_db_new_connections_total`.
+
+Note these only appear **after** the app image containing the change is actually
+rolled out (§19.8) — changing `settings.py` alone does nothing until a release ships.
+
+### 20.2 Server-side (postgres_exporter)
+
+`k8s-manifests/postgres-exporter.yaml` deploys the exporter, a Service, and its
+ServiceMonitor. Credentials are read from the existing `postgres-secret`, so no
+password is duplicated:
+
+```yaml
+env:
+  # postgres-svc is headless, but DNS still resolves to the pod IP
+  - name: DATA_SOURCE_URI
+    value: "postgres-svc:5432/db?sslmode=disable"
+  - name: DATA_SOURCE_USER
+    valueFrom:
+      secretKeyRef: { name: postgres-secret, key: POSTGRES_USER }
+  - name: DATA_SOURCE_PASS
+    valueFrom:
+      secretKeyRef: { name: postgres-secret, key: POSTGRES_PASSWORD }
+```
+
+The Service is labelled `monitoring: postgres` and its ServiceMonitor selects that
+label (same pattern as the track Services in §19.4).
+
+Apply and verify:
+```bash
+kubectl apply -f k8s-manifests/postgres-exporter.yaml
+kubectl rollout status deployment/postgres-exporter -n dev --timeout=120s
+
+# pg_up must be 1 — the pod starting is NOT proof it connected to the database
+kubectl logs -n dev deployment/postgres-exporter --tail=10   # look for "Established new database connection"
+curl -s 'http://localhost:9090/api/v1/query' --data-urlencode 'query=pg_up'
+```
+
+Provides: `pg_up`, `pg_stat_database_numbackends` (active connections),
+`pg_locks_count`, `pg_database_size_bytes`, `pg_replication_lag_seconds`, plus the
+full `pg_settings_*` set.
+
+### 20.3 Example DB queries
+
+```promql
+# app-side: query rate and latency, split by track
+sum by (track) (rate(django_db_execute_total[2m]))
+histogram_quantile(0.95, sum by (track, le) (rate(django_db_query_duration_seconds_bucket[5m])))
+
+# server-side: active connections, lock pressure
+pg_stat_database_numbackends{datname="db"}
+pg_locks_count
 ```
