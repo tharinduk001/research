@@ -1079,3 +1079,128 @@ histogram_quantile(0.95, sum by (track, le) (rate(django_db_query_duration_secon
 pg_stat_database_numbackends{datname="db"}
 pg_locks_count
 ```
+
+---
+
+## 21. Load generator (k6)
+
+Without it ~100% of traffic is health probes, so no user-facing code path is
+exercised and a broken canary can look healthy. Required before any dataset work.
+
+`k8s-manifests/load-generator.yaml` = ConfigMap (k6 script) + Deployment. Key design
+choices, all deliberate:
+- Targets the **in-cluster** Service, not the public HTTPS URL — external LB adds
+  internet latency jitter that is not caused by the code change, i.e. noise in the
+  canary-vs-stable comparison. Internal HTTP also sidesteps Django's CSRF referer check.
+- `constant-arrival-rate` executor — the load itself must not vary, or that variance
+  becomes a confounder.
+- ~5% of iterations do a **failed POST login**. This is the only path that touches the
+  database (`auth.authenticate()` queries the User table); GET views just render
+  templates. Without it the `django_db_*` metrics stay at zero.
+- No k6 thresholds — k6 must never abort. Errors during a bad canary are the signal
+  being recorded, not a reason to stop generating load.
+
+```bash
+kubectl apply -f k8s-manifests/load-generator.yaml
+kubectl rollout status deployment/loadgen -n dev --timeout=180s
+```
+
+Change the rate (takes effect immediately, restarts the pod):
+```bash
+kubectl set env deployment/loadgen -n dev RATE=25
+```
+
+Start / stop without deleting:
+```bash
+kubectl scale deployment loadgen -n dev --replicas=0    # stop
+kubectl scale deployment loadgen -n dev --replicas=1    # start
+```
+
+### 21.1 App resource sizing (must be done before running load)
+
+The original manifests requested 64Mi/125m and limited 128Mi/250m. That cannot
+survive real traffic — the container runs 3 gunicorn workers × 6 threads, and each
+worker needs 60-80Mi. Starting the load generator OOMKilled all 5 pods (exit 137).
+Current values, already in the manifests:
+
+```yaml
+resources:
+  requests: { memory: "256Mi", cpu: "300m" }
+  limits:   { memory: "512Mi", cpu: "2000m" }
+```
+
+> **Do not `kubectl apply -f k8s-manifests/stable-deployment.yaml` to change
+> resources on a live cluster** — that file hardcodes `canary-app:1` and applying it
+> would roll the app back to the first image. Patch the live deployment instead:
+> ```bash
+> for d in django-stable django-canary; do
+>   kubectl set resources deployment/$d -n dev \
+>     --requests=memory=256Mi,cpu=300m --limits=memory=512Mi,cpu=2000m
+> done
+> ```
+
+> **Why cpu limit is 2000m and not 1000m:** at 1000m, CPU throttling sat at 56% even
+> though actual usage was only ~300m — 18 gunicorn threads exhaust the CFS quota in
+> bursts. Throttling ratio is a fault signal for this project, so its baseline must be
+> low (now ~1.7%) or a real CPU regression produces no visible rise.
+
+### 21.2 Manual verification commands
+
+Assumes `kubectl port-forward svc/prometheus-kube-prometheus-prometheus -n default 9090:9090`
+is running.
+
+```bash
+# --- pod health: all Running, restarts should stay at 0 ---
+kubectl get pods -n dev
+kubectl top pods -n dev -l track=stable
+
+# --- OOMKill check (exit 137 = out of memory) ---
+kubectl get pod -n dev -l track=stable -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.status.containerStatuses[0].lastState.terminated.reason}{"\n"}{end}'
+
+# --- load generator health: look for "Request Failed", should be none ---
+kubectl logs -n dev deployment/loadgen --tail=20
+kubectl logs -n dev deployment/loadgen --since=60s | grep -c "Request Failed"
+
+# --- traffic mix by view (user views should dominate, not ready/live) ---
+curl -s 'http://localhost:9090/api/v1/query' --data-urlencode \
+  'query=topk(8, sum by (view) (rate(django_http_requests_total_by_view_transport_method_total[3m])))'
+
+# --- total throughput and error rate ---
+curl -s 'http://localhost:9090/api/v1/query' --data-urlencode \
+  'query=sum(rate(django_http_requests_total_by_method_total[3m]))'
+curl -s 'http://localhost:9090/api/v1/query' --data-urlencode \
+  'query=sum(rate(django_http_responses_total_by_status_total{status=~"5.."}[3m])) or vector(0)'
+
+# --- CPU throttling ratio: must stay low (~0.02), else the signal is saturated ---
+curl -s 'http://localhost:9090/api/v1/query' --data-urlencode \
+  'query=avg(sum by (pod) (rate(container_cpu_cfs_throttled_periods_total{namespace="dev",pod=~"django-stable.*"}[3m])) / sum by (pod) (rate(container_cpu_cfs_periods_total{namespace="dev",pod=~"django-stable.*"}[3m])))'
+
+# --- latency PER VIEW (aggregate percentiles are misleading, see RESEARCH_STATUS 3.5) ---
+curl -s 'http://localhost:9090/api/v1/query' --data-urlencode \
+  'query=histogram_quantile(0.95, sum by (view, le) (rate(django_http_requests_latency_seconds_by_view_method_bucket[3m])))'
+
+# --- DB is actually being exercised (should be non-zero) ---
+curl -s 'http://localhost:9090/api/v1/query' --data-urlencode \
+  'query=sum(rate(django_db_execute_total[3m]))'
+
+# --- track split (during a rollout: stable + canary both present) ---
+curl -s 'http://localhost:9090/api/v1/query' --data-urlencode \
+  'query=count by (track) (up{job=~"django.*"})'
+```
+
+### 21.3 Healthy baseline (2026-07-25, RATE=25)
+
+Reference values for comparison — if these drift substantially, something changed:
+
+| Signal | Healthy value |
+|---|---|
+| total throughput | ~50 req/s |
+| 5xx rate | 0 |
+| p50 latency (all views) | ~6 ms |
+| p95 latency (all views) | ~42 ms |
+| p99 latency | ~1.9 s (login POST only — expected, see RESEARCH_STATUS §3.5) |
+| every view except `login` | < 75 ms at p99 |
+| CPU throttling | ~1.7% |
+| memory per pod | ~135 Mi of 512 Mi |
+| CPU per pod | 200-460m of 2000m |
+| DB queries | ~10.5/s |

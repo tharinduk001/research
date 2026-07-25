@@ -18,7 +18,8 @@ phase is research proper: generating labelled data and building the prediction m
 |---|---|
 | Infrastructure (Terraform, GKE, CI/CD, canary) | Complete |
 | Observability (metrics, logs, DB) | Complete |
-| Realistic traffic | **Not started — blocking** |
+| Realistic traffic (k6 load generator) | Complete |
+| Baseline characterisation (3 no-fault deploys) | **Next** |
 | Fault injection / dataset generation | Not started |
 | Feature extraction collector | Not started |
 | AI prediction engine | Not started |
@@ -83,21 +84,60 @@ percentiles over short windows during the rollout — too few samples for reliab
 quantile estimation. This is direct evidence that simple statistical tests are weak
 inside the 60-120 s decision window, independent of the warmup problem above.
 
-### 3.3 Current traffic is not representative
+### 3.3 Traffic — resolved by the k6 load generator
 
-Request breakdown observed on the running system:
+Before: essentially **100% of traffic was health probes and metric scrapes**; no
+user-facing view was exercised, so a broken canary could have looked healthy.
 
-| view | approx. rate |
-|---|---|
-| `ready` (readiness probe) | ~198/s |
-| `live` (liveness probe) | ~26/s |
-| `prometheus-django-metrics` | ~17/s |
-| `start` | ~0.02/s |
+After (`k8s-manifests/load-generator.yaml`, ~25 iterations/s → ~50 req/s):
 
-Essentially **100% of traffic is health probes and metric scrapes**. No user-facing
-view (`/`, login, register) is being exercised at all. Until a load generator exists,
-a badly broken canary could look healthy because nothing touches the code paths that
-would fail.
+| | before | after |
+|---|---|---|
+| `home` | 0 | ~6.5/s |
+| `login` | 0 | ~13/s |
+| `register` | 0 | ~2.4/s |
+| health probes | ~100% of traffic | ~2/s |
+| DB queries | 0 | ~10.5/s |
+
+### 3.4 App resource limits were broken (found by starting the load)
+
+Starting the load generator immediately **OOMKilled all 5 pods** (exit 137). The cause
+was pre-existing, not the load: the container runs 3 gunicorn workers × 6 threads
+against a **128Mi** memory limit. It only survived previously because there was no
+traffic. Had this been discovered later, every deployment in the dataset would have
+been fighting an artificial memory ceiling.
+
+CPU then became the bottleneck. Note the intermediate state — at a 1000m limit,
+throttling sat at **56% while actual usage was only ~300m**, because 18 gunicorn
+threads exhaust the CFS quota in bursts even at low average utilisation.
+
+| | original | current |
+|---|---|---|
+| memory request/limit | 64Mi / 128Mi | 256Mi / 512Mi |
+| cpu request/limit | 125m / 250m | 300m / 2000m |
+| CPU throttling | 98% | **1.7%** |
+| p95 latency | 207 ms | 42 ms |
+
+**Why the throttling number matters:** CPU throttling ratio is one of the leading
+indicator signals (§2). At a 56-98% baseline it is already saturated and a
+CPU-related fault produces no visible rise. At 1.7% it is a usable signal.
+
+### 3.5 Latency is bimodal — use per-view features, not aggregate
+
+| | p50 | p95 | p99 |
+|---|---|---|---|
+| all views | 6.1 ms | 42 ms | **1.94 s** |
+| `login` only | 5.9 ms | — | **2.50 s** |
+| every other view | — | — | < 75 ms |
+
+The entire p99 tail is the **login POST**. Django's password hasher (PBKDF2, ~600k
+iterations) is deliberately expensive, and failed logins still pay full cost because
+Django hashes a dummy password to prevent timing attacks.
+
+**Consequence for feature engineering:** aggregate p95/p99 is driven by the *mix* of
+fast GETs vs slow POSTs, not by application health — a slight shift in traffic mix
+moves the aggregate percentile even when nothing is wrong. Model features must be
+**per-view latency**, not aggregate latency.
 
 ---
 
@@ -155,16 +195,24 @@ failure."
 
 ## 7. Next steps
 
-1. **Load generator** (k6 or Locust, in-cluster) hitting real user paths — blocking
-   everything else.
+1. ~~Load generator~~ — done, see §3.3.
 2. **Three no-fault deployments** to characterise the healthy-deploy baseline and the
-   warmup curve precisely, before faults complicate interpretation.
+   warmup curve precisely, before faults complicate interpretation. Commands:
+   SETUP_GUIDE §14.
 3. **Feature collector** — given a deployment start time, pull a wide time-windowed
    feature vector from Prometheus + Loki. Same code path for dataset building and
-   live inference, to avoid train/serve skew.
+   live inference, to avoid train/serve skew. Must use **per-view** latency (§3.5)
+   and record **pod age** (§3.1).
 4. **Pilot dataset** (~20 deployments, 3-4 fault types) to validate the loop
    end-to-end before scaling.
 5. Analysis (§5), then scale up and train.
+
+Deferred, revisit when relevant:
+- Add a `track` label to Promtail's log pipeline (§2) so logs can be compared
+  canary-vs-stable the same way metrics already can.
+- Session rows accumulate in Postgres from load-generator login POSTs (Django creates
+  a session to store the failure message). Watch `pg_database_size_bytes`; add a
+  `clearsessions` CronJob if growth becomes material.
 
 ---
 
