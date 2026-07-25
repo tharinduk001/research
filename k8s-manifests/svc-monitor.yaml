@@ -1,15 +1,27 @@
+# Tells the Prometheus Operator what to scrape.
+#
+# It selects the two monitoring-only Services in track-svc.yaml (both carry the
+# label `monitoring: django`), so stable and canary pods are scraped as two
+# distinct groups.
+#
+# `targetLabels: [track]` copies each Service's own `track` label onto every
+# metric scraped through it. That is what produces track="stable" /
+# track="canary" on the metrics themselves, so PromQL can compare the two
+# directly — e.g.  rate(django_http_responses_total_by_status_total{track="canary"}[1m])
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: django-servicemonitor
+  namespace: dev
   labels:
-    release: prometheus     # <-- must match your Prometheus Operator's serviceMonitorSelector
+    release: prometheus      # must match the Prometheus Helm release name
 spec:
-  jobLabel: job
   selector:
     matchLabels:
-      app: django            # <-- matches django-svc's labels
+      monitoring: django     # matches django-stable-svc and django-canary-svc
+  targetLabels:
+    - track                  # Service label -> metric label
   endpoints:
-    - port: web              # <-- matches the named port above
+    - port: web
       path: /metrics
       interval: 15s

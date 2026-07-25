@@ -717,54 +717,109 @@ notes for a different GCP project) was not applicable here:
 inputs: `namespace` (choice: prod/staging/dev/qa/default), and 3 booleans to
 independently toggle installing Prometheus+Grafana / Loki / Promtail.
 
-**`k8s-manifests/svc-monitor.yaml`** — copied in and used as-is (already matched our
-app):
+**`k8s-manifests/svc-monitor.yaml`** — brought in, then **rewritten** (see §19.4). The
+reference repo's version scraped a single Service, which cannot tell stable pods from
+canary pods — a hard requirement for this project (§19.4).
+
+### 19.4 Separating stable from canary metrics (per-track Services)
+
+**The problem.** The reference repo's `ServiceMonitor` scraped one Service
+(`django-svc`), which selects `app: django` — i.e. **both** tracks at once. Metrics
+came back tagged only with `pod`, `job`, `namespace`, `container`, `service`. Pod
+*labels* (`track: stable` / `track: canary`, which the Deployments do set) are **not**
+carried onto metrics automatically. So there was no clean way to ask "how is canary
+behaving compared to stable?" — only fragile pod-name regexes.
+
+This matters because the research goal (predicting rollout failure) depends on
+comparing the canary against the stable baseline running at the same moment.
+
+**The fix — two monitoring-only Services, one per track.** These carry no user
+traffic; `django-svc` still serves that, and the Ingress references it by name.
+These exist purely so Prometheus sees each track as its own group.
+
+`k8s-manifests/track-svc.yaml`:
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: django-stable-svc
+  namespace: dev
+  labels:
+    monitoring: django     # what the ServiceMonitor selects on
+    track: stable          # copied onto metrics via targetLabels
+spec:
+  type: ClusterIP
+  selector:
+    app: django
+    track: stable          # only stable pods land in this Service's Endpoints
+  ports:
+    - name: web
+      port: 8000
+      targetPort: 8000
+---
+# django-canary-svc — identical, with track: canary in both labels and selector
+```
+
+`k8s-manifests/svc-monitor.yaml` (rewritten):
 ```yaml
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: django-servicemonitor
+  namespace: dev
   labels:
-    release: prometheus     # must match the Prometheus Helm release name
+    release: prometheus      # must match the Prometheus Helm release name
 spec:
-  jobLabel: job
   selector:
     matchLabels:
-      app: django            # matches django-svc's labels
+      monitoring: django     # matches BOTH track Services
+  targetLabels:
+    - track                  # copies each Service's `track` label onto its metrics
   endpoints:
-    - port: web              # matches the named port on django-svc
+    - port: web
       path: /metrics
       interval: 15s
 ```
 
-### 19.4 Fix required: `django-svc` had no labels or named port
+**Why `targetLabels` is the key line.** It copies a *Service's* own labels onto every
+metric scraped through that Service. Because `django-stable-svc` is labelled
+`track: stable`, everything scraped through it arrives tagged `track="stable"`. That
+turns track comparison into ordinary PromQL:
+```promql
+rate(django_http_responses_total_by_status_total{track="canary"}[1m])
+```
+(The alternative — `relabelings` with `__meta_kubernetes_pod_label_track` — reads pod
+labels directly and needs no extra Services, but the per-Service approach above was
+chosen as the clearer model to reason about.)
 
-The `ServiceMonitor` above selects Services by **their own `metadata.labels`** (not
-their pod-selector) and references the scrape port **by name**, not number. Our
-existing `k8s-manifests/app-svc.yaml` had neither — it would have matched zero
-targets. Fixed:
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: django-svc
-  namespace: dev
-  labels:
-    app: django              # added — required for ServiceMonitor's selector to match
-spec:
-  type: ClusterIP
-  selector:
-    app: django
-  ports:
-    - name: web               # added — required for ServiceMonitor's `port: web` to resolve
-      port: 8000
-      targetPort: 8000
-```
-Applied directly (safe, no downtime — Service selector/spec unchanged, only labels
-and a port name added):
+**Avoiding double-scraping.** The `ServiceMonitor` deliberately selects on
+`monitoring: django`, a label only the two new Services carry. `django-svc` keeps its
+`app: django` label and is therefore **not** scraped — otherwise every pod would be
+scraped twice (once per Service) and produce duplicate series.
+
+Apply (no downtime — nothing about traffic routing changes):
 ```bash
-kubectl apply -f k8s-manifests/app-svc.yaml
+kubectl apply -f k8s-manifests/track-svc.yaml
+kubectl apply -f k8s-manifests/svc-monitor.yaml
 ```
+
+Verify — expect exactly one scrape pool, and a `track` label on the metrics:
+```bash
+kubectl get endpoints -n dev     # django-stable-svc has pods; django-canary-svc is
+                                 # empty between releases (canary sits at 0 replicas)
+
+curl -s 'http://localhost:9090/api/v1/query' \
+  --data-urlencode 'query=count by (track) (up{job=~"django.*"})'
+```
+
+> **Note on `django-svc`:** its `app: django` label and named port `web` (added
+> earlier, when it was still the scrape target) are now unused by monitoring. They are
+> harmless and were left in place.
+
+> **Known drift:** `helm-charts/deployments/templates/` has not been updated with the
+> track Services or the ServiceMonitor. The raw manifests in `k8s-manifests/` are the
+> deployment path actually used by this project (§11); the Helm chart is an unused
+> alternative and was already out of sync before this change.
 
 ### 19.5 GitHub secrets
 
@@ -828,7 +883,8 @@ urlpatterns = [
 ### 19.7 Commit, push, deploy the monitoring stack
 
 ```bash
-git add .github/workflows/automate.yaml k8s-manifests/svc-monitor.yaml k8s-manifests/app-svc.yaml
+git add .github/workflows/automate.yaml k8s-manifests/svc-monitor.yaml \
+        k8s-manifests/track-svc.yaml k8s-manifests/app-svc.yaml
 git commit -m "Add Prometheus+Grafana+Loki+Promtail monitoring pipeline"
 git push origin main
 
@@ -862,10 +918,12 @@ gh run list --repo tharinduk001/research --workflow=cd.yaml --limit 1
 gh run watch <run-id> --repo tharinduk001/research --exit-status
 ```
 
-Then apply the `ServiceMonitor` (only possible after §19.7 has run — its CRD doesn't
-exist until Prometheus Operator installs it):
+Then apply the track Services and the `ServiceMonitor` (the ServiceMonitor is only
+possible after §19.7 has run — its CRD doesn't exist until Prometheus Operator
+installs it):
 ```bash
-kubectl apply -f k8s-manifests/svc-monitor.yaml -n dev
+kubectl apply -f k8s-manifests/track-svc.yaml
+kubectl apply -f k8s-manifests/svc-monitor.yaml
 ```
 
 ### 19.9 Verify metrics are actually flowing
@@ -918,9 +976,18 @@ curl -s -X POST http://admin:<grafana-password>@localhost:8081/api/datasources \
 
 PromQL (Prometheus Graph tab or Grafana Explore → Prometheus datasource):
 ```promql
-up{job=~".*django.*"}
-django_http_requests_total_by_view_transport_method_total
-django_http_requests_latency_seconds_by_view_method_bucket
+# scrape health, split by track
+count by (track) (up{job=~"django.*"})
+
+# request/error rates per track
+sum by (track) (rate(django_http_requests_total_by_method_total[1m]))
+sum by (track) (rate(django_http_responses_total_by_status_total{status=~"5.."}[1m]))
+
+# canary vs stable latency comparison (the core research signal — during a rollout,
+# when django-canary has running pods)
+histogram_quantile(0.95,
+  sum by (track, le) (rate(django_http_requests_latency_seconds_by_view_method_bucket[1m]))
+)
 ```
 
 LogQL (Grafana Explore → Loki datasource):

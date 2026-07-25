@@ -1,0 +1,46 @@
+# Monitoring-only Services.
+#
+# These do NOT serve user traffic — django-svc (app-svc.yaml) still does that,
+# and the Ingress points at it by name. These two exist purely so Prometheus can
+# scrape the stable and canary pods as two separate groups.
+#
+# Each one selects a single track, so its Endpoints contain only that track's
+# pods. The ServiceMonitor (svc-monitor.yaml) then copies each Service's own
+# `track` label onto every metric it scrapes, which is what lets you write
+# queries like:  django_http_responses_total_by_status_total{track="canary"}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: django-stable-svc
+  namespace: dev
+  labels:
+    monitoring: django     # what the ServiceMonitor selects on
+    track: stable          # copied onto metrics via ServiceMonitor targetLabels
+spec:
+  type: ClusterIP
+  selector:
+    app: django
+    track: stable
+  ports:
+    - name: web
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: django-canary-svc
+  namespace: dev
+  labels:
+    monitoring: django
+    track: canary
+spec:
+  type: ClusterIP
+  selector:
+    app: django
+    track: canary
+  ports:
+    - name: web
+      port: 8000
+      targetPort: 8000
