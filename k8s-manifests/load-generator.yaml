@@ -1,0 +1,123 @@
+# Synthetic load generator (k6).
+#
+# WHY THIS EXISTS: without it, ~100% of requests to the app are health probes
+# (/ready/, /live/) and Prometheus scrapes. No user-facing view is exercised, so a
+# badly broken canary can look perfectly healthy. Every downstream research step
+# (fault injection, feature extraction, model training) depends on realistic traffic.
+#
+# DESIGN NOTES:
+#   - Targets the in-cluster Service, NOT the public HTTPS URL. Going through the
+#     external load balancer would add internet latency jitter that is not caused by
+#     the code change — noise in exactly the canary-vs-stable comparison the research
+#     depends on. Internal HTTP also sidesteps Django's CSRF referer check.
+#   - Uses constant-arrival-rate, not ramping load. The load itself must not vary, or
+#     that variance becomes a confounder.
+#   - Rate is set so that even at canary step 1 (1 of 5 pods, ~20% of traffic) the
+#     canary pod still receives enough requests in a 60s window for percentile
+#     estimates to be meaningful.
+#   - Includes a small proportion of POST logins because that is the ONLY path that
+#     touches the database (auth.authenticate queries the User table). GET views just
+#     render templates. Failed logins are fine — they still exercise the DB and auth.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loadgen-script
+  namespace: dev
+data:
+  script.js: |
+    import http from 'k6/http';
+
+    const BASE = __ENV.TARGET_URL;
+    const RATE = parseInt(__ENV.RATE || '40');
+
+    export const options = {
+      scenarios: {
+        steady: {
+          executor: 'constant-arrival-rate',
+          rate: RATE,
+          timeUnit: '1s',
+          duration: '720h',
+          preAllocatedVUs: 20,
+          maxVUs: 80,
+        },
+      },
+      // No thresholds on purpose: k6 must never abort. Errors during a bad canary
+      // are the signal we want recorded, not a reason to stop generating load.
+      thresholds: {},
+      insecureSkipTLSVerify: true,
+    };
+
+    export default function () {
+      const r = Math.random();
+
+      if (r < 0.60) {
+        http.get(`${BASE}/`, { tags: { path: 'home' } });
+
+      } else if (r < 0.80) {
+        http.get(`${BASE}/login/`, { tags: { path: 'login_get' } });
+
+      } else if (r < 0.95) {
+        http.get(`${BASE}/register/`, { tags: { path: 'register_get' } });
+
+      } else {
+        // DB-exercising path: fetch the form for its CSRF token, then POST a
+        // deliberately failing login. auth.authenticate() hits the User table.
+        const page = http.get(`${BASE}/login/`, { tags: { path: 'login_get' } });
+        const m = page.body
+          ? page.body.match(/name="csrfmiddlewaretoken" value="([^"]+)"/)
+          : null;
+        if (m) {
+          http.post(
+            `${BASE}/login/`,
+            {
+              csrfmiddlewaretoken: m[1],
+              username: `loadtest_${Math.floor(Math.random() * 10000)}`,
+              password: 'deliberately-wrong',
+            },
+            { tags: { path: 'login_post' } }
+          );
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen
+  namespace: dev
+  labels:
+    app: loadgen
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loadgen
+  template:
+    metadata:
+      labels:
+        app: loadgen
+    spec:
+      containers:
+        - name: k6
+          image: grafana/k6:0.49.0
+          args: ["run", "/scripts/script.js"]
+          env:
+            - name: TARGET_URL
+              value: "http://django-svc.dev.svc.cluster.local:8000"
+            - name: RATE
+              value: "40"                # requests/second, cluster-wide
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: script
+          configMap:
+            name: loadgen-script
