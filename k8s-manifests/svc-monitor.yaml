@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: django-servicemonitor
+  labels:
+    release: prometheus     # <-- must match your Prometheus Operator's serviceMonitorSelector
+spec:
+  jobLabel: job
+  selector:
+    matchLabels:
+      app: django            # <-- matches django-svc's labels
+  endpoints:
+    - port: web              # <-- matches the named port above
+      path: /metrics
+      interval: 15s

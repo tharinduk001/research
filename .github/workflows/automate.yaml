@@ -1,0 +1,168 @@
+name: (Prometheus + Grafana + Loki + Promtail)
+
+on:
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: "Kubernetes namespace to deploy into"
+        required: true
+        type: choice
+        options:
+          - prod
+          - staging
+          - dev
+          - qa
+          - default
+
+      install_prometheus_grafana:
+        description: "Install/Upgrade Prometheus + Grafana stack"
+        required: true
+        type: boolean
+        default: true
+
+      install_loki:
+        description: "Install/Upgrade Loki"
+        required: true
+        type: boolean
+        default: true
+
+      install_promtail:
+        description: "Install/Upgrade Promtail"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ secrets.GCP_REGION }}
+  GKE_CLUSTER: ${{ secrets.GKE_CLUSTER_NAME }}
+  GKE_ZONE: ${{ secrets.GKE_CLUSTER_LOCATION }}
+  K8S_NAMESPACE: ${{ github.event.inputs.namespace }}
+
+jobs:
+  monitoring-deploy:
+    name: Deploy Monitoring Stack
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+
+      - name: Connect to GKE Cluster
+        run: gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE --project $GCP_PROJECT_ID
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Ensure namespace exists
+        run: kubectl create namespace $K8S_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Add Helm repos
+        run: |
+          set -e
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo update
+
+      - name: Install/Upgrade Prometheus + Grafana
+        if: ${{ github.event.inputs.install_prometheus_grafana == 'true' }}
+        run: |
+          set -e
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+            --namespace $K8S_NAMESPACE \
+            --create-namespace \
+            --rollback-on-failure \
+            --timeout 10m
+
+      - name: Write Loki values file
+        if: ${{ github.event.inputs.install_loki == 'true' }}
+        run: |
+          cat <<EOF > loki-values.yaml
+          deploymentMode: SingleBinary
+
+          loki:
+            auth_enabled: false
+            commonConfig:
+              replication_factor: 1
+            storage:
+              type: filesystem
+            schemaConfig:
+              configs:
+                - from: "2024-01-01"
+                  store: tsdb
+                  object_store: filesystem
+                  schema: v13
+                  index:
+                    prefix: loki_index_
+                    period: 24h
+
+          singleBinary:
+            replicas: 1
+
+          read:
+            replicas: 0
+          write:
+            replicas: 0
+          backend:
+            replicas: 0
+
+          gateway:
+            enabled: false
+
+          test:
+            enabled: false
+
+          lokiCanary:
+            enabled: false
+
+          chunksCache:
+            enabled: false
+
+          resultsCache:
+            enabled: false
+          EOF
+          cat loki-values.yaml
+
+      - name: Install/Upgrade Loki
+        if: ${{ github.event.inputs.install_loki == 'true' }}
+        run: |
+          set -e
+          helm upgrade --install loki grafana/loki \
+            --namespace $K8S_NAMESPACE \
+            --create-namespace \
+            -f loki-values.yaml \
+            --rollback-on-failure \
+            --timeout 10m
+
+      - name: Install/Upgrade Promtail
+        if: ${{ github.event.inputs.install_promtail == 'true' }}
+        run: |
+          set -e
+          helm upgrade --install promtail grafana/promtail \
+            --namespace $K8S_NAMESPACE \
+            --create-namespace \
+            --set "config.clients[0].url=http://loki.$K8S_NAMESPACE.svc.cluster.local:3100/loki/api/v1/push" \
+            --rollback-on-failure \
+            --timeout 10m
+
+      - name: Verify pods
+        run: |
+          kubectl get pods --namespace $K8S_NAMESPACE
+          kubectl get svc --namespace $K8S_NAMESPACE
