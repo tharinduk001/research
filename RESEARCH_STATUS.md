@@ -4,7 +4,7 @@ Living status document for the research side of the project. For *how to rebuild
 infrastructure*, see [SETUP_GUIDE.md](SETUP_GUIDE.md). For *how canary releases work
 here*, see [CANARY_TRAFFIC_EXPLAINED.md](CANARY_TRAFFIC_EXPLAINED.md).
 
-**Last updated:** 2026-07-25
+**Last updated:** 2026-07-26
 
 ---
 
@@ -89,15 +89,17 @@ inside the 60-120 s decision window, independent of the warmup problem above.
 Before: essentially **100% of traffic was health probes and metric scrapes**; no
 user-facing view was exercised, so a broken canary could have looked healthy.
 
-After (`k8s-manifests/load-generator.yaml`, ~25 iterations/s → ~50 req/s):
+After (`k8s-manifests/load-generator.yaml`, ~25 iterations/s → ~32 req/s):
 
 | | before | after |
 |---|---|---|
-| `home` | 0 | ~6.5/s |
-| `login` | 0 | ~13/s |
-| `register` | 0 | ~2.4/s |
+| user-facing views (`home`, `login`, `register`) | 0 | ~30/s combined |
 | health probes | ~100% of traffic | ~2/s |
-| DB queries | 0 | ~10.5/s |
+| DB queries | 0 | ~7/s |
+
+(Per-view figures measured under the corrupt-metrics regime were withdrawn; see §3.4b.
+The `login` view receives disproportionately more requests than its 5% POST share
+because k6 follows the post-failure redirect back to the login page.)
 
 ### 3.4 App resource limits were broken (found by starting the load)
 
