@@ -19,9 +19,9 @@ phase is research proper: generating labelled data and building the prediction m
 | Infrastructure (Terraform, GKE, CI/CD, canary) | Complete |
 | Observability (metrics, logs, DB) | Complete |
 | Realistic traffic (k6 load generator) | Complete |
-| Baseline characterisation (3 no-fault deploys) | **Next** |
+| Baseline characterisation (3 no-fault deploys) | Complete |
+| Feature extraction collector | **Next** |
 | Fault injection / dataset generation | Not started |
-| Feature extraction collector | Not started |
 | AI prediction engine | Not started |
 | Decision engine | Not started |
 
@@ -55,27 +55,40 @@ makes canary-vs-stable comparison possible. See SETUP_GUIDE §19.4.
 
 ## 3. Empirical findings
 
-### 3.1 Cold-start bias is large and would break threshold-based analysis
+### 3.1 Cold-start bias — WITHDRAWN, was a measurement artifact
 
-Measured during the tag `6` rollout (2026-07-25), with only health-probe traffic:
+**Originally claimed:** during the tag `6` rollout, canary p95 was 663 ms against
+stable's 24.6 ms (27× worse) at pod start, implying pod warmup would defeat any static
+threshold and motivating a "warmup-aware" model contribution.
 
-| | stable | canary |
-|---|---|---|
-| p95 latency at pod start | 24.6 ms | **663 ms** (27× worse) |
-| p95 latency at ~85 s | 24.6 ms | 44.8 ms |
+**That claim is wrong.** It was measured when the system had only health-probe traffic,
+so p95 was computed over a handful of requests and the first few cold ones dominated
+it. It was sparse-data noise (§3.2) misread as a warmup curve.
 
-The canary was **completely healthy** — the difference is entirely pod warmup (cold
-caches, unwarmed DB connection pool, Django lazy imports).
+Re-measured across **three clean deployments** (tags 8/9/10) with the load generator
+running, `home` view p95 at the canary's first sample versus stable at the same instant:
 
-**Implications:**
-- Any static threshold (e.g. "roll back if p95 > 100 ms") would roll back a healthy
-  deployment on *every* release, not occasionally.
-- The CD bake period is 60 s and warmup takes roughly 60-90 s, so the pipeline makes
-  its "step 1 passed" decision **while the pod is still warming up**. Early-window
-  signal is dominated by warmup, not by code quality. This is a concrete mechanism
-  explaining why threshold methods only catch failures late in a rollout.
-- Canary was still 1.8× stable at 85 s, so **pod age is a genuine model feature**,
-  not merely a filter/exclusion window.
+| run | canary first sample | stable | difference |
+|---|---|---|---|
+| baseline 1 | 9.5 ms | 9.5 ms | 0% |
+| baseline 2 | 9.6 ms | 9.5 ms | +1% |
+| baseline 3 | 9.7 ms | 9.5 ms | +2% |
+
+On aggregate (all-view) p95 the canary's first sample was actually **faster** than
+stable in two of the three runs.
+
+**Mechanism missed originally:** the pod has a `startupProbe` on `/start/` and a
+`readinessProbe` on `/ready/` (every 5 s) that must pass *before* Kubernetes adds it to
+the Service. Django is fully loaded and warm by the time real traffic reaches it —
+warmup happens during the probe phase and never appears in request metrics.
+
+**Methodological lesson for the write-up:** a 27× effect measured on one run of an
+idle system should have been treated as suspect, not as a headline result. Conclusions
+here need a minimum of three runs under representative load.
+
+Residual open question: this app is trivial (template render, no cache priming, small
+import graph). A heavier application with connection-pool ramp or cache warming could
+still show a genuine effect. Not evidenced here, and should not be claimed without data.
 
 ### 3.2 Short windows are statistically sparse
 
@@ -166,10 +179,53 @@ The entire p99 tail is the **login POST**. Django's password hasher (PBKDF2, ~60
 iterations) is deliberately expensive, and failed logins still pay full cost because
 Django hashes a dummy password to prevent timing attacks.
 
+**Quantified across the three baseline deployments** (coefficient of variation =
+sd/mean of p95 sampled every 15 s through the rollout; lower is a cleaner signal):
+
+| | aggregate (all views) | `home` view only |
+|---|---|---|
+| baseline 1 canary / stable | 1.29 / 1.29 | **0.004 / 0.005** |
+| baseline 2 canary / stable | 2.45 / 1.95 | **0.005 / 0.002** |
+| baseline 3 canary / stable | 1.76 / 1.91 | **0.007 / 0.002** |
+
+Choosing per-view over aggregate latency reduces baseline noise by roughly **300×**.
+On aggregate, the standard deviation *exceeds the mean* (cv > 1) — a regression would
+have to be enormous to be detectable. Per-view, cv ≈ 0.005, so a few-percent
+regression is detectable.
+
+This is the single most consequential feature-engineering decision found so far:
+**granularity matters more than model sophistication.** No model can recover signal
+from a cv > 1 feature that better feature selection makes trivially separable.
+
 **Consequence for feature engineering:** aggregate p95/p99 is driven by the *mix* of
 fast GETs vs slow POSTs, not by application health — a slight shift in traffic mix
 moves the aggregate percentile even when nothing is wrong. Model features must be
 **per-view latency**, not aggregate latency.
+
+---
+
+### 3.6 Healthy-deploy baseline profile (n=3, tags 8/9/10)
+
+The reference a faulty deployment gets compared against. Recorded in
+`data/deployments.csv`; regenerate with `scripts/run-deployment.sh clean`.
+
+| Property | Value |
+|---|---|
+| rollout duration | 389 / 387 / 385 s (±0.5%) |
+| outcome | success, rollback job skipped, all 3 |
+| 5xx responses | **zero** — only 200 and 302 have ever been recorded |
+| `home` p95, either track | 9.5 ms, sd < 0.1 ms |
+| canary first sample vs stable | within 2% (§3.1) |
+| aggregate p95 cv | 1.3-2.5 (unusable, §3.5) |
+| per-view p95 cv | 0.002-0.007 (clean, §3.5) |
+
+**Implication for labelling:** a clean deployment is extremely well-behaved — zero
+errors, sub-1% duration variance, per-view latency stable to a fraction of a
+millisecond. Separating clean from faulty should be easy for any reasonable model
+*provided* the features are per-view. The research difficulty is therefore not
+"detect the failure" but **detect it early, from the canary's small sample, before
+the rollout proceeds** — which is where the 60-120 s window and the fusion of weak
+signals actually matter.
 
 ---
 
@@ -189,7 +245,10 @@ Working statement, sharpened by finding 3.1:
 2. Log-template novelty as an early high-precision signal — a template appearing in
    canary but never in stable is strong evidence of regression, and surfaces before
    aggregate error rates move.
-3. Warmup-aware analysis (motivated directly by finding 3.1).
+3. ~~Warmup-aware analysis~~ — **withdrawn**, the motivating finding did not replicate
+   (§3.1). Replaced by: **feature-granularity analysis** — per-view rather than
+   aggregate signals reduce baseline noise ~300× (§3.5), which bounds the minimum
+   detectable regression regardless of model choice.
 4. Time-to-detection as a primary evaluation metric, not just accuracy.
 
 ---

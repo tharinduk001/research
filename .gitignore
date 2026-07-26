@@ -5,3 +5,4 @@ terraform/.terraform/
 terraform/.terraform.lock.hcl
 terraform/key.json
 terraform/*.tfvars
+# dataset artifacts are kept (small, and they are the research record)
