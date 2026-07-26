@@ -1,4 +1,5 @@
 deploy_id,label,image_tag,ci_run_id,cd_run_id,start_ts,end_ts,duration_s,outcome,notes
 1,clean,8,30187441189,30187474224,1785039288,1785039677,389,success,"baseline 1 of 3, single-worker metrics, RATE=25"
 2,clean,9,30187654966,30187689208,1785039773,1785040160,387,success,"baseline 2 of 3"
-3,clean,10,30187919714,30187951525,1785040354,1785040739,385,success,"baseline 3 of 3"
+3,clean,10,30187919714,30187951525,1785040354,1785040739,385,success,"EXCLUDED: loadgen OOMKilled during rollout tail, traffic dropped ~40%, superseded by deploy_id=4"
+4,clean,11,30188540414,30188570299,1785041788,1785042172,384,success,"baseline 3 REDONE - original run corrupted by loadgen OOMKill mid-rollout"

@@ -72,7 +72,7 @@ running, `home` view p95 at the canary's first sample versus stable at the same 
 |---|---|---|---|
 | baseline 1 | 9.5 ms | 9.5 ms | 0% |
 | baseline 2 | 9.6 ms | 9.5 ms | +1% |
-| baseline 3 | 9.7 ms | 9.5 ms | +2% |
+| baseline 3 | 9.5 ms | 9.5 ms | 0% |
 
 On aggregate (all-view) p95 the canary's first sample was actually **faster** than
 stable in two of the three runs.
@@ -186,7 +186,7 @@ sd/mean of p95 sampled every 15 s through the rollout; lower is a cleaner signal
 |---|---|---|
 | baseline 1 canary / stable | 1.29 / 1.29 | **0.004 / 0.005** |
 | baseline 2 canary / stable | 2.45 / 1.95 | **0.005 / 0.002** |
-| baseline 3 canary / stable | 1.76 / 1.91 | **0.007 / 0.002** |
+| baseline 3 canary / stable | 1.85 / 2.04 | **0.003 / 0.003** |
 
 Choosing per-view over aggregate latency reduces baseline noise by roughly **300×**.
 On aggregate, the standard deviation *exceeds the mean* (cv > 1) — a regression would
@@ -204,15 +204,28 @@ moves the aggregate percentile even when nothing is wrong. Model features must b
 
 ---
 
-### 3.6 Healthy-deploy baseline profile (n=3, tags 8/9/10)
+### 3.6 Healthy-deploy baseline profile (n=3, tags 8/9/11)
 
 The reference a faulty deployment gets compared against. Recorded in
 `data/deployments.csv`; regenerate with `scripts/run-deployment.sh clean`.
 
+> **deploy_id=3 (tag 10) is marked EXCLUDED in the CSV, not deleted.** The load
+> generator OOMKilled itself ~72s before that rollout ended (`discardResponseBodies`
+> was not set, so k6 retained full response bodies per VU; as latency rose mid-rollout
+> the VU count climbed toward `maxVUs` and memory followed). Traffic measurably dropped
+> from ~31 to ~18 req/s during the affected window. Fixed in
+> `k8s-manifests/load-generator.yaml` (bodies discarded by default, memory limit
+> 256Mi→512Mi) and the run repeated cleanly as deploy_id=4 (tag 11, zero loadgen
+> restarts). All figures below use deploy_id 1, 2, 4. This is itself a finding worth
+> keeping: **the load generator is part of the measurement instrument and needs the
+> same monitoring discipline as the system under test** — a silent 40% traffic drop
+> would corrupt any deployment's features exactly like an injected fault would, and be
+> indistinguishable from one without checking the generator's own health.
+
 | Property | Value |
 |---|---|
-| rollout duration | 389 / 387 / 385 s (±0.5%) |
-| outcome | success, rollback job skipped, all 3 |
+| rollout duration | 389 / 387 / 384 s (±0.5%) |
+| outcome | success, rollback job skipped, all 3 (deploy_id 1, 2, 4 — see note below) |
 | 5xx responses | **zero** — only 200 and 302 have ever been recorded |
 | `home` p95, either track | 9.5 ms, sd < 0.1 ms |
 | canary first sample vs stable | within 2% (§3.1) |

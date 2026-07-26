@@ -32,6 +32,12 @@ data:
     const RATE = parseInt(__ENV.RATE || '40');
 
     export const options = {
+      // Drop response bodies by default. k6 retains them per-VU otherwise, and when
+      // app latency rises mid-rollout the VU count climbs toward maxVUs, spiking
+      // memory. That OOMKilled the generator during a rollout and silently cut
+      // traffic ~40% at the tail of the run, corrupting that deployment's data.
+      // The one request that needs a body opts in with responseType: 'text'.
+      discardResponseBodies: true,
       scenarios: {
         steady: {
           executor: 'constant-arrival-rate',
@@ -63,7 +69,10 @@ data:
       } else {
         // DB-exercising path: fetch the form for its CSRF token, then POST a
         // deliberately failing login. auth.authenticate() hits the User table.
-        const page = http.get(`${BASE}/login/`, { tags: { path: 'login_get' } });
+        const page = http.get(`${BASE}/login/`, {
+          tags: { path: 'login_get' },
+          responseType: 'text',      // opt back in: body needed for the CSRF token
+        });
         const m = page.body
           ? page.body.match(/name="csrfmiddlewaretoken" value="([^"]+)"/)
           : null;
@@ -106,17 +115,18 @@ spec:
             - name: TARGET_URL
               value: "http://django-svc.dev.svc.cluster.local:8000"
             - name: RATE
-              value: "40"                # requests/second, cluster-wide
+              value: "25"                # requests/second, cluster-wide. Reduced
+                                          # from an initial 40 — see SETUP_GUIDE 21.1
           volumeMounts:
             - name: script
               mountPath: /scripts
           resources:
             requests:
               cpu: 100m
-              memory: 128Mi
+              memory: 256Mi
             limits:
               cpu: 500m
-              memory: 256Mi
+              memory: 512Mi   # was 256Mi; OOMKilled mid-rollout, see script comment
       volumes:
         - name: script
           configMap:

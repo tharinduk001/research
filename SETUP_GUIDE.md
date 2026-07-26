@@ -1245,3 +1245,34 @@ with 8 threads has ample headroom.
 **Unaffected by this bug:** `container_*` (cAdvisor), `kube_*` (kube-state-metrics)
 and `pg_*` (postgres_exporter) are scraped independently of gunicorn and were always
 correct.
+
+### 21.5 The load generator itself needs monitoring
+
+k6 was OOMKilled (exit 137) mid-rollout during one baseline run, silently dropping
+traffic ~40% for the last ~72s of that deployment — corrupting its data without any
+error on the app side. Cause: `discardResponseBodies` was not set, so k6 retained
+full response bodies per VU; as latency rose mid-rollout the VU count climbed toward
+`maxVUs` and memory followed.
+
+Fixed in `k8s-manifests/load-generator.yaml`:
+```js
+export const options = {
+  discardResponseBodies: true,   // opt in per-request where a body is actually needed
+  ...
+};
+```
+```python
+http.get(url, { responseType: 'text' })   # only on the one request that reads the CSRF token
+```
+Memory limit also raised 256Mi → 512Mi as headroom.
+
+**Always check the generator's own health, not just the app's, when validating a
+deployment:**
+```bash
+kubectl get pod -n dev -l app=loadgen -o jsonpath='restarts={.items[0].status.containerStatuses[0].restartCount}{"\n"}'
+kubectl top pod -n dev -l app=loadgen
+```
+A restarted or resource-starved load generator produces exactly the same symptom as a
+real fault (a traffic/latency anomaly) with none of the interest — treat any
+deployment overlapping a loadgen restart as invalid and re-run it, don't try to
+salvage the data.
