@@ -53,6 +53,62 @@ makes canary-vs-stable comparison possible. See SETUP_GUIDE §19.4.
 
 ---
 
+## 2b. Locked feature spec — what the collector extracts
+
+Every feature is a **canary-vs-stable contrast at the same timestamp** (ratio or
+delta), never an absolute value. Every HTTP/DB feature is **per-view**, never
+aggregate (§3.5: aggregate cv > 1, per-view cv ≈ 0.003–0.007 — a ~300× difference in
+usable signal). This is the target the feature collector is built against.
+
+**Tier 1 — HTTP behaviour**
+| Metric | Feature |
+|---|---|
+| `django_http_requests_latency_seconds_by_view_method_bucket` | p50/p95 latency per view |
+| `django_http_responses_total_by_status_view_method_total` | error rate per view |
+| `django_http_requests_total_by_view_transport_method_total` | throughput per view (also: sample count backing each percentile) |
+| `django_http_requests_body_total_bytes_*` / `django_http_responses_body_total_bytes_*` | request/response size drift |
+
+**Tier 2 — Database (app side + server side)**
+| Metric | Feature |
+|---|---|
+| `django_db_execute_total` | query rate |
+| `django_db_query_duration_seconds_bucket` | query latency percentile |
+| `django_db_new_connections_total` | connection churn |
+| `pg_stat_database_numbackends` | active server connections |
+| `pg_locks_count` | lock contention |
+
+**Tier 3 — Resource pressure (leading indicators)**
+| Metric | Feature |
+|---|---|
+| `container_cpu_cfs_throttled_periods_total` / `container_cpu_cfs_periods_total` | CPU throttle ratio |
+| `container_memory_working_set_bytes` | memory vs limit, and slope over the window |
+| `process_resident_memory_bytes` | Python-process RSS, slope (leak detection) |
+| `python_gc_collections_total` | GC rate |
+| `kube_pod_container_status_restarts_total` | restart count |
+| pod waiting/terminated `reason` | `CrashLoopBackOff` / `OOMKilled` / `Error` — near-free fault-type label |
+
+**Tier 4 — Logs** (Loki; no `track` label yet — see gap above, use pod-name regex)
+- Log-template novelty (Drain3): count of templates in canary absent from the stable
+  baseline vocabulary — highest-value single log feature, surfaces before aggregate
+  error rate moves
+- `detected_level` distribution: INFO/WARN/ERROR counts per window
+- String matches: `Traceback`, `OperationalError`/`ProgrammingError` (bad migration),
+  `WORKER TIMEOUT`, `DisallowedHost`/CSRF (config drift)
+
+**Tier 5 — Deployment context** (free, known at t=0)
+- Migration file / `requirements.txt` / `settings.py` touched (bool each)
+- Diff size, files changed
+- Time since last deployment
+- Current canary replica count (rollout step)
+- Pod age (kept as a control variable despite §3.1's retraction — costs nothing,
+  may matter on a heavier application)
+
+**Deliberately excluded:** `pg_database_size_bytes`, `pg_replication_lag_seconds` —
+too slow-moving for a 60–120s window; no replica exists in this setup so replication
+lag is structurally always zero.
+
+---
+
 ## 3. Empirical findings
 
 ### 3.1 Cold-start bias — WITHDRAWN, was a measurement artifact
