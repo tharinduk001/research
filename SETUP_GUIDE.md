@@ -1188,19 +1188,60 @@ curl -s 'http://localhost:9090/api/v1/query' --data-urlencode \
   'query=count by (track) (up{job=~"django.*"})'
 ```
 
-### 21.3 Healthy baseline (2026-07-25, RATE=25)
+### 21.3 Healthy baseline (2026-07-26, RATE=25, image tag 7)
 
-Reference values for comparison — if these drift substantially, something changed:
+Measured **after** the single-worker fix (§21.4) — earlier figures were corrupted and
+must not be used. Reference values; if these drift substantially, something changed:
 
 | Signal | Healthy value |
 |---|---|
-| total throughput | ~50 req/s |
+| total throughput | ~32 req/s |
 | 5xx rate | 0 |
+| DB queries | ~7/s |
 | p50 latency (all views) | ~6 ms |
 | p95 latency (all views) | ~42 ms |
-| p99 latency | ~1.9 s (login POST only — expected, see RESEARCH_STATUS §3.5) |
-| every view except `login` | < 75 ms at p99 |
-| CPU throttling | ~1.7% |
-| memory per pod | ~135 Mi of 512 Mi |
-| CPU per pod | 200-460m of 2000m |
-| DB queries | ~10.5/s |
+| p99 latency (all views) | ~1.9 s — login POST only, see RESEARCH_STATUS §3.5 |
+| p95 `login` | ~1.6 s (password hashing, expected) |
+| p95 `home` / `register` | ~10 ms |
+| CPU throttling | ~2% |
+| memory per pod | ~62 Mi of 512 Mi |
+| CPU per pod | 300-400m of 2000m |
+
+### 21.4 Gunicorn must run a single worker (metrics correctness)
+
+**Do not raise `--workers` above 1 without reading this.**
+
+django-prometheus keeps its counters in process memory. With N gunicorn workers each
+worker holds its own independent counters, and `/metrics` is served by whichever
+worker answers the scrape. Prometheus therefore sees the counter jump up and down,
+treats every drop as a counter reset, and adds the "lost" amount — inflating `rate()`
+without bound as the workers diverge.
+
+Observed with 3 workers: a single pod's counter alternated between ~56k / ~72k / ~89k,
+and `sum(rate(...))` reported **9,500 req/s against an actual ~30 req/s** (~800x). The
+error grows over time as workers drift apart, so a freshly-rolled deployment looks
+only mildly wrong while a long-running one is catastrophically wrong.
+
+Detect it:
+```bash
+# Counter MUST increase monotonically. Sawtoothing between distinct value bands
+# means multiple workers are reporting independently.
+P=$(kubectl get pods -n dev -l track=stable -o jsonpath='{.items[0].metadata.name}')
+END=$(date +%s); START=$((END-180))
+curl -s 'http://localhost:9090/api/v1/query_range' \
+  --data-urlencode "query=django_http_requests_total_by_method_total{pod=\"$P\",method=\"GET\"}" \
+  --data-urlencode "start=$START" --data-urlencode "end=$END" --data-urlencode 'step=20'
+```
+
+Also sanity-check throughput against what k6 is actually sending
+(`kubectl logs -n dev deployment/loadgen | grep iters/s`) — a large mismatch is the
+same symptom.
+
+The alternative fix (`PROMETHEUS_MULTIPROC_DIR`) keeps multiple workers but drops
+`process_*` and `python_gc_*` from the registry; those are wanted as leading-indicator
+signals, so the single worker was preferred. Load is ~6 req/s per pod, so one worker
+with 8 threads has ample headroom.
+
+**Unaffected by this bug:** `container_*` (cAdvisor), `kube_*` (kube-state-metrics)
+and `pg_*` (postgres_exporter) are scraped independently of gunicorn and were always
+correct.

@@ -122,12 +122,42 @@ threads exhaust the CFS quota in bursts even at low average utilisation.
 indicator signals (§2). At a 56-98% baseline it is already saturated and a
 CPU-related fault produces no visible rise. At 1.7% it is a usable signal.
 
+### 3.4b Metrics were corrupted by multi-worker gunicorn (fixed, tag 7)
+
+The app ran 3 gunicorn workers. django-prometheus keeps counters in **process** memory,
+so each worker held its own, and `/metrics` was answered by whichever worker took the
+scrape. Prometheus saw the counter drop on every worker switch, treated it as a reset,
+and inflated `rate()` — reporting **9,500 req/s against an actual ~30 req/s** (~800x).
+
+The error is **non-deterministic and grows over time** as workers diverge, so it could
+not have been corrected for after the fact. Had it gone unnoticed, every deployment in
+the dataset would have carried meaningless request-rate and latency figures.
+
+Fixed by running a single worker with 8 threads (`--workers 1 --threads 8`). See
+SETUP_GUIDE §21.4 for the detection command and why `PROMETHEUS_MULTIPROC_DIR` was not
+used.
+
+| | reported (corrupt) | actual |
+|---|---|---|
+| throughput | ~50 req/s | ~32 req/s |
+| DB queries | ~10.5/s | ~7/s |
+| memory per pod | ~135 Mi | ~62 Mi (1 worker, not 3) |
+
+**Unaffected:** `container_*`, `kube_*`, `pg_*` are scraped independently of gunicorn.
+All findings in §3.1 and §3.4 (cold-start bias, OOMKill, CPU throttling) therefore
+stand — they rest on container-level metrics.
+
+**Methodological note for the write-up:** aggregate percentiles happened to survive
+roughly intact (p50/p95 barely moved) because `histogram_quantile` computes a *ratio*
+across buckets, and all workers had similar distributions. That is luck, not
+robustness — the histogram counts were just as corrupt.
+
 ### 3.5 Latency is bimodal — use per-view features, not aggregate
 
 | | p50 | p95 | p99 |
 |---|---|---|---|
-| all views | 6.1 ms | 42 ms | **1.94 s** |
-| `login` only | 5.9 ms | — | **2.50 s** |
+| all views | 6.1 ms | 42 ms | **1.89 s** |
+| `login` only | ~6 ms | 1.64 s | ~1.9 s |
 | every other view | — | — | < 75 ms |
 
 The entire p99 tail is the **login POST**. Django's password hasher (PBKDF2, ~600k
